@@ -1,16 +1,27 @@
-from collections import namedtuple
-
 import numpy as np
-import astropy.units as u
 
-from sqlalchemy import create_engine, ForeignKey, select
+from sqlalchemy.types import TypeDecorator
+from sqlalchemy import (
+    create_engine,
+    ForeignKey,
+    select
+)
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
     mapped_column,
     relationship,
-    Session
+    Session,
+    sessionmaker
 )
+
+from spher_rect_transformations import (
+    sphere2rect,
+    rect2sphere,
+    DEG2RAD,
+    RAD2DEG
+)
+from type_decorators import NpFloat, NpInt
 
 
 __all__ = [
@@ -26,163 +37,213 @@ __all__ = [
 
 
 engine = create_engine("sqlite+pysqlite:///example.sqlite3")
+"""An Engine object providing DB connectivity and behavior functionality."""
 
-# SQLAlch 2.0 seems to come with some bright and shiny new toys!
+
+session = sessionmaker(engine)
+"""An Session factory providing transactional functionality."""
+
+
 class Base(DeclarativeBase):
+    """Declarative Base used to keep track of DB's metadata."""
     pass
 
 
 class TanWcs(Base):
+    """
+    A table representing the simplified tangential plane projection (TAN) of an
+    Wold Coordinate System (WCS) of an exposure.
+
+    The recorded values are sufficient to perform the linear transformations to
+    intermediate pixel coordinates, as described by Greisen and Calabretta in
+    their 1st paper. The assumptions that the values are given in decimal
+    degree format, in a Earth-centered Ecliptic Coordinate System, with no
+    additional non-linear transformations are required to complete the
+    transformation to the final world coordinates.
+    """
     __tablename__= "tan_wcs"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(NpInt, primary_key=True)
+    """Unique auto-incremented ID of the WCS."""
 
     # these are the basic values WCS stores
     # * reference pixel in img coordinates
     # * reference pixel in on sky-coordinates
     # * delta-change of sky coordinates, if you move 1 pixel up/down/left/right
     # good enough for approximate calculations of positions
-    crpix1: Mapped[float]
-    crpix2: Mapped[float]
-    crval1: Mapped[float]
-    crval2: Mapped[float]
-    cd11: Mapped[float]
-    cd12: Mapped[float]
-    cd21: Mapped[float]
-    cd22: Mapped[float]
+    crpix1: Mapped[float] = mapped_column(NpFloat)
+    """Center reference pixel's x-coordinate, in image coordinates."""
+    crpix2: Mapped[float] = mapped_column(NpFloat)
+    """Center reference pixel's y-coordinate, in image coordinates."""
 
-    geomcoord: Mapped["GeometricCoords"] = relationship(back_populates="tanwcs")
+    crval1: Mapped[float] = mapped_column(NpFloat)
+    """Center reference pixel's right ascension, in sky coordinates."""
+    crval2: Mapped[float] = mapped_column(NpFloat)
+    """Center reference pixel's declination, in sky coordinates."""
+
+    cd11: Mapped[float] = mapped_column(NpFloat)
+    """Element (1, 1) of the affine transformation matrix."""
+    cd12: Mapped[float] = mapped_column(NpFloat)
+    """Element (1, 2) of the affine transformation matrix."""
+    cd21: Mapped[float] = mapped_column(NpFloat)
+    """Element (2, 1) of the affine transformation matrix."""
+    cd22: Mapped[float] = mapped_column(NpFloat)
+    """Element (2, 2) of the affine transformation matrix."""
+
+    rectcoord: Mapped["RectangularCoords"] = relationship(back_populates="tanwcs")
+    """Related rectangular coordinates associated with the reference, and
+    corner pixel."""
 
     def __repr__(self):
         return f"TanWcs({self.id}, {self.crval1}, {self.crval2})"
 
     @classmethod
     def query_square_naive(cls, ra, dec, size=1):
-        with Session(engine) as session:
+        """Returns all records with coordinates within a square of given size
+        around the given center `(ra, dec)` coordinates.
+
+        Note that this selection is rather naive as it's performed as:
+        ```
+        crval1 BETWEEN ra-size/2 AND ra+size/2
+        crval2 BETWEEN dec-size/2 AND dec+size/2
+        ```
+        with no explicit wrapping or spherical distance calculations.
+
+        Parameters
+        ----------
+        ra : `float`
+            Right ascension of the center of the square, in degrees
+        dec : `float`
+            Declination of the center of the square, in degrees
+        size : `float`, optional
+            Size of the square box around the center coordinates, in degrees.
+            Defaults to a square 1x1 degree in size.
+
+        Returns
+        -------
+        records : `numpy.array`
+            An array of `(ra, dec)` pairs within the requested square box.
+        """
+        with session.begin() as transaction:
             stmt = (
                 select(cls.crval1, cls.crval2)
                 .where(cls.crval1.between(ra-size/2, ra+size/2))
                 .where(cls.crval2.between(dec-size/2, dec+size/2))
             )
-            res = session.execute(stmt).all()
+            res = transaction.execute(stmt).all()
         return np.array(res)
 
     @classmethod
     def all(cls):
-        with Session(engine) as session:
-            res = session.execute(
+        """Returns an array of `(ra, dec)` pairs of all records in the table."""
+        with session.begin() as transaction:
+            res = transaction.execute(
                 select(cls.crval1, cls.crval2)
             )
         return np.array(res.all())
 
 
-GeomPoint = namedtuple("GeomPoint", ("x", "y", "z"))
-
-
-SpherePoint = namedtuple("SpherePoint", ("rho", "theta", "phi"))
-
-
-def sphere2geom(ra, dec):
-    x = np.cos(ra)*np.cos(dec)
-    y = np.sin(ra)*np.cos(dec)
-    z = np.sin(dec)
-    return GeomPoint(x, y, z)
-
-
-def geom2sphere(x, y, z):
-    r2 = x**2 + y**2
-    theta = 0 if r2 == 0 else np.atan2(y, x)
-    phi = 0 if z == 0 else np.atan2(z, np.sqrt(r2))
-    return SpherePoint(rho, theta, phi)
-
-
-class GeometricCoords(Base):
-    __tablename__ = "geom_coords"
+class RectangularCoords(Base):
+    """
+    A table representing the rectangular coordinates associated with the
+    tan_wcs rows. The rectangular coordinates represented the reference pixel,
+    the top-left corner pixel and the radius records the Euclidean distance
+    between the two.
+    """
+    __tablename__ = "rect_coords"
 
     # these are the extended values, calculated at ingestion
     # these are first order improvement on searching WCS pointing
     # data directly because these columns can be indexed and subselected
     # from more easily than the TanWcs
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(NpInt, primary_key=True)
+    """Unique auto-incremented ID of the associate rectangular coordinates."""
 
-    radius: Mapped[float]
+    radius: Mapped[float] = mapped_column(NpFloat)
+    """Euclidean distance between the reference pixel and top left corner."""
 
-    center_x: Mapped[float]
-    center_y: Mapped[float]
-    center_z: Mapped[float]
+    refpix_x: Mapped[float] = mapped_column(NpFloat)
+    """X coordinate of the reference pixel."""
+    refpix_y: Mapped[float] = mapped_column(NpFloat)
+    """Y coordinate of the reference pixel."""
+    refpix_z: Mapped[float] = mapped_column(NpFloat)
+    """Z coordinate of the reference pixel."""
 
-    corner_x: Mapped[float]
-    corner_y: Mapped[float]
-    corner_z: Mapped[float]
+    corner_x: Mapped[float] = mapped_column(NpFloat)
+    """X coordinate of the top-left corner pixel."""
+    corner_y: Mapped[float] = mapped_column(NpFloat)
+    """X coordinate of the top-left corner pixel."""
+    corner_z: Mapped[float] = mapped_column(NpFloat)
+    """X coordinate of the top-left corner pixel."""
 
-    tanwcs_id = mapped_column(ForeignKey("tan_wcs.id"))
-    tanwcs: Mapped[TanWcs] = relationship(back_populates="geomcoord")
+    tanwcs_id = mapped_column(NpInt, ForeignKey("tan_wcs.id"))
+    """The ID of the associated TanWCS."""
+    tanwcs: Mapped[TanWcs] = relationship(back_populates="rectcoord")
+    """The associated TanWCS object."""
 
     def __repr__(self):
-        return f"Geom({id}, {center_x:.2}, {center_y:.2}, {center_z:.2})"
+        return f"RectCoord({id}, {refpix_x:.2}, {refpix_y:.2}, {refpix_z:.2})"
 
-    def get_sphere_representation(self):
+    def get_spherical_coords(self):
+        """Returns the spherical coordinates of the center and the corner."""
         return (
-            geom2sphere(self.center_x, self.center_y, self.center_z),
-            geom2sphere(self.corner_x, self.corner_y, self.corner_z)
+            rect2sphere(self.refpix_x, self.refpix_y, self.refpix_z),
+            rect2sphere(self.corner_x, self.corner_y, self.corner_z)
         )
 
     @classmethod
-    def query_square_naive(cls, ra, dec, gsize=0.1):
-        center = sphere2geom((ra*u.deg).to(u.rad), (dec*u.deg).to(u.rad))
-        with Session(engine) as session:
+    def query_square(cls, ra, dec, size=1):
+        """Returns all records with coordinates within a square of given size
+        around the given center `(ra, dec)` coordinates.
+
+        Note that this selection is nor rather naive as its TanWCS counterpart
+        as the conversion to rectangular coordinates, of the given coordinates
+        occurs before querying, So, while the query resembles the TanWCS one:
+        ```
+        x BETWEEN x-size/2 AND x+size/2
+        y BETWEEN y-size/2 AND y+size/2
+        z BETWEEN z-size/2 AND z+size/2
+        ```
+        the end result does in fact include wrapping and correct distance
+        calculation between points.
+
+        Parameters
+        ----------
+        ra : `float`
+            Right ascension of the center of the square, in degrees
+        dec : `float`
+            Declination of the center of the square, in degrees
+        size : `float`, optional
+            Size of the square box around the center coordinates, in degrees.
+            Defaults to a square 1x1 degree in size.
+
+        Returns
+        -------
+        records : `numpy.array`
+            An array of `(ra, dec)` pairs within the requested square box.
+        """
+        size = size*DEG2RAD
+        s2 = size/2.0
+        center = sphere2rect(ra*DEG2RAD, dec*DEG2RAD)
+
+        with session.begin() as transaction:
             stmt = (
                 select(TanWcs.crval1, TanWcs.crval2)
                 .join(cls.tanwcs)
-                .where(cls.center_x.between(center.x-gsize/2, center.x+gsize/2))
-                .where(cls.center_y.between(center.y-gsize/2, center.y+gsize/2))
-                .where(cls.center_z.between(center.z-gsize/2, center.z+gsize/2))
+                .where(cls.refpix_x.between(center.x-s2, center.x+s2))
+                .where(cls.refpix_y.between(center.y-s2, center.y+s2))
+                .where(cls.refpix_z.between(center.z-s2, center.z+s2))
             )
-            res = session.execute(stmt).all()
+            res = transaction.execute(stmt).all()
         return np.array(res)
 
     @classmethod
     def all(cls):
-        with Session(engine) as session:
-            res = session.execute(
-                select(cls.center_x, cls.center_y, cls.center_z)
+        """Returns an array of `(x, y, z)` triplets of all of the recorded
+        reference pixels.
+        """
+        with session.begin() as transaction:
+            res = transaction.execute(
+                select(cls.refpix_x, cls.refpix_y, cls.refpix_z)
             )
         return np.array(res.all())
-
-
-Base.metadata.create_all(engine)
-
-
-
-
-
-
-
-
-# from sqlalchemy.types import Double, Integer, TypeDecorator
-# and then promptly squashes my optimism by breaking what they
-# used to be happy to do...
-# https://github.com/sqlalchemy/sqlalchemy/issues/5167
-# https://github.com/sqlalchemy/sqlalchemy/issues/3586
-# https://github.com/sqlalchemy/sqlalchemy/issues/5552
-# https://github.com/sqlalchemy/sqlalchemy/discussions/5948
-# https://docs.sqlalchemy.org/en/13/faq/thirdparty.html#i-m-getting-errors-related-to-numpy-int64-numpy-bool-etc
-#    class GenFloat(TypeDecorator):
-#        # coerces given data to float() before storing
-#        # to avoid explosions due to np.int types
-#        impl = Double
-#        cache_ok = True
-#
-#        def process_bind_param(self, value, dialect):
-#            return float(value)
-#
-#    class GenInteger(TypeDecorator):
-#        # coerces given data to float() before storing
-#        # to avoid explosions due to np.int types
-#        impl = Integer
-#        cache_ok = True
-#
-#        def process_bind_param(self, value, dialect):
-#            return int(value)
-# won't use this atm because it's just faster to cast everything
-# than to rewrite the tables. TODO: later.
