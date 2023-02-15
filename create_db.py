@@ -6,11 +6,18 @@ import numpy as np
 import astropy.units as u
 from astropy.wcs import WCS
 from astropy.io import fits
+from astropy.time import Time
+from astropy.coordinates import (
+    ICRS,
+    HeliocentricTrueEcliptic,
+    GeocentricTrueEcliptic
+)
 
 from models import (
     session,
     TanWcs,
     RectangularCoords,
+    RectangularHeliocentricCoords,
     Base,
     engine
 )
@@ -27,13 +34,14 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(message)s'
 )
 
+
 ###############################################################################
 #                                    CONFIG
 ###############################################################################
 
 # Sets the number of frames that will be faked and ingested
 NFRAMES = 30000
-logging.info(f"Creating example.sqlite3 DB containing {NFRAMES} faked pointings.")
+DISTANCE = 50*u.AU
 
 
 ###############################################################################
@@ -42,11 +50,15 @@ logging.info(f"Creating example.sqlite3 DB containing {NFRAMES} faked pointings.
 # these settings are modifiable but only if you know what they docs. We are
 # faking a bunch of WCSs. This has to be done with some amount of attention to
 # details because validation will be difficult and results won't make sense.
-chunksize = 10000
+chunksize = int(NFRAMES/2) if NFRAMES <= 10000 else 10000
+
+nchunks = int(np.rint(NFRAMES/chunksize))
+nchunks = 1 if nchunks==0 else nchunks
+
 idxs = np.arange(1, NFRAMES+1, dtype=int)
 ras = np.random.uniform(0, 360.0, size=NFRAMES)
 decs = np.random.uniform(-90.0, 90.0, size=NFRAMES)
-
+mjds = np.random.uniform(59945.0, 60307.0, size=NFRAMES)
 
 hdu = fits.PrimaryHDU()
 header = hdu.header
@@ -60,40 +72,35 @@ header["CD1_2"] = 0.000258453338150409
 header["CD2_1"] = 0.000258874499780883
 header["CD2_2"] = 0.000720016854665084
 
+logging.info(f"Creating example.sqlite3 DB, "
+             f"containing {NFRAMES} faked pointings ranging from "
+             f"{Time(mjds[0], format='mjd', scale='utc').isot} to "
+             f"{Time(mjds[-1], format='mjd', scale='utc').isot}")
+
 
 ###############################################################################
 #                                FAKING DATA
 ###############################################################################
 
-def chunkify(iterable, chunk_size=10000):
+def chunkify(iterable, chunk_size):
     """Yields successive `chunk_size`d chunks from `iterable`."""
     for i in range(0, len(iterable), chunk_size):
         yield iterable[i:i+chunk_size]
 
-
-# cleanup old remains
+# cleanup old DB
 if os.path.exists("example.sqlite3"):
     os.remove("example.sqlite3")
     logging.info(f"Found old DB, removed it.")
     Base.metadata.create_all(engine)
 
-
 logging.info("Faking pointings....")
 st = time.time()
 
-# create the lists of related TanWCS and RectangularCoords to ingest into DB.
-# The faked WCSs will all have the same distortion coefficients to the sky
-# coordinates and the reference pixel, which is a realistic scenario for an
-# space observatory over reasonably-short time periods.
-# Each, however, will have a different value for the CRVAL12, setting different
-# values of sky coordinates for the reference pixel.
-# For each of these, we need to construct a WCS, in order to properly calculate
-# the value of the corner pixel and radii. This is not immediately important
-# for us, but is important when trying to calculate overlap.
-# These, refpix and corner, are then converted to rectangular coordinates.
-tanwcss, rectcoords = [], []
-for idx, ra, dec in zip(idxs, ras, decs):
-    # create our TanWCS, assign the idx to speed up ingestion into DB
+# create the lists of related TanWCS, RectangularCoords and
+# RectangularHeliocentricCoords to ingest into DB.
+tanwcss, rectcoords, rectheliocoords = [], [], []
+for idx, ra, dec, mjd in zip(idxs, ras, decs, mjds):
+    # create our TanWCS, we assign the idx to speed up ingestion into DB
     tanwcss.append(TanWcs(
         id = idx,
         crpix1 = header["CRPIX1"],
@@ -107,6 +114,7 @@ for idx, ra, dec in zip(idxs, ras, decs):
     ))
 
     # Construct the WCS, calc corner, convert to rect, create and append obj
+    # This section is basically what's required for RectangularCoords
     hdu.header["CRVAL1"] = ra
     hdu.header["CRVAL2"] = dec
     wcs = WCS(hdu)
@@ -118,9 +126,12 @@ for idx, ra, dec in zip(idxs, ras, decs):
     corner_sky_rad = (corner_sky*u.degree).to(u.rad)
     corner = sphere2rect(*corner_sky_rad)
 
-    radius = np.sqrt((corner.x-refpix.x)**2 + (corner.y-refpix.y)**2 + (corner.z-refpix.z)**2)
+    radius = np.sqrt(
+        (corner.x-refpix.x)**2 +
+        (corner.y-refpix.y)**2 +
+        (corner.z-refpix.z)**2
+    )
 
-    # note indices must match for foreign keys, but for us it's the same
     rectcoords.append(RectangularCoords(
         id = idx,
         refpix_x = refpix.x,
@@ -129,26 +140,56 @@ for idx, ra, dec in zip(idxs, ras, decs):
         corner_x = corner.x,
         corner_y = corner.y,
         corner_z = corner.z,
-        radius =   radius,
+        radius = radius,
         tanwcs_id = idx,
-        tanwcs =   tanwcss[-1],
+        tanwcs = tanwcss[-1],
     ))
 
-et = time.time()
-logging.info(f"Successfully faked {NFRAMES} pointings in {et-st} seconds.")
+    # Specify the remaining missing WCS values - coord. sys., scale and times
+    # Transform to heliocentric ecliptic and then represent as rectangular
+    # coordinates. This is what's required for RectangularHeliocentricCoords
+    t = Time(mjd, format="mjd", scale="utc")
+    refpix_icrs = ICRS(ra=ra*u.deg, dec=dec*u.deg)
+    refpix_geo = refpix_icrs.transform_to(GeocentricTrueEcliptic(obstime=t))
 
+    refpix_nolie = GeocentricTrueEcliptic(
+        refpix_geo.lon,
+        refpix_geo.lat,
+        distance=DISTANCE,
+        obstime=t
+    )
+    refpix_helio = refpix_nolie.transform_to(HeliocentricTrueEcliptic(obstime=t))
+
+    refpix = sphere2rect(refpix_helio.lon.rad, refpix_helio.lat.rad)
+    rectheliocoords.append(RectangularHeliocentricCoords(
+        id = idx,
+        refpix_x = refpix.x,
+        refpix_y = refpix.y,
+        refpix_z = refpix.z,
+        tanwcs_id = idx,
+        tanwcs = tanwcss[-1],
+    ))
+
+    if idx % chunksize == 0:
+        et = time.time()
+        logging.info(
+            f"    {int(idx/chunksize)}/{nchunks} chunks faked. "
+            f"Time elapsed: {et-st} seconds."
+        )
 
 # ingest the data into the DB in 10k slices because SQLite can't deal with more
 # https://www.sqlite.org/limits.html#max_sql_length
 # https://www.sqlite.org/limits.html#max_variable_number
 twcs_chunks = chunkify(tanwcss, chunksize)
 rect_chunks = chunkify(rectcoords, chunksize)
+recthelio_chunks = chunkify(rectheliocoords, chunksize)
 
-nchunks = int(np.rint(NFRAMES/chunksize))
 logging.info("Ingesting the faked pointings...")
-for i, (tw_chunk, rc_chunk) in enumerate(zip(twcs_chunks, rect_chunks)):
+for i, (tw_chunk, rc_chunk, rhc_chunk) in enumerate(zip(twcs_chunks, rect_chunks, recthelio_chunks)):
     with session.begin() as transaction:
         transaction.bulk_save_objects(tw_chunk)
         transaction.bulk_save_objects(rc_chunk)
+        transaction.bulk_save_objects(rhc_chunk)
     logging.info(f"    {i+1}/{nchunks} chunks ingested successfully.")
-logging.info("Success!")
+et = time.time()
+logging.info(f"Success! Total time elapsed {et-st} seconds.")

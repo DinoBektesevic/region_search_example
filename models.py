@@ -26,13 +26,10 @@ from type_decorators import NpFloat, NpInt
 
 __all__ = [
     "engine",
+    "session",
     "TanWcs",
-    "GeometricCoords",
-    "Session",
-    "GeomPoint",
-    "SpherePoint",
-    "sphere2geom",
-    "geom2sphere"
+    "RectangularCoords",
+    "RectangularHeliocentricCoords",
 ]
 
 
@@ -93,6 +90,9 @@ class TanWcs(Base):
     rectcoord: Mapped["RectangularCoords"] = relationship(back_populates="tanwcs")
     """Related rectangular coordinates associated with the reference, and
     corner pixel."""
+    rectheliocoord: Mapped["RectangularHeliocentricCoords"] = relationship(back_populates="tanwcs")
+    """Related rectangular heliocentric coordinates associated with the
+    reference, and corner pixel."""
 
     def __repr__(self):
         return f"TanWcs({self.id}, {self.crval1}, {self.crval2})"
@@ -145,10 +145,10 @@ class TanWcs(Base):
 
 class RectangularCoords(Base):
     """
-    A table representing the rectangular coordinates associated with the
-    tan_wcs rows. The rectangular coordinates represented the reference pixel,
-    the top-left corner pixel and the radius records the Euclidean distance
-    between the two.
+    A table representing the rectangular coordinate representations associated
+    with the `tan_wcs` rows. The rectangular coordinates represented the
+    reference pixel, the top-left corner pixel and the radius records the
+    Euclidean distance between the two.
     """
     __tablename__ = "rect_coords"
 
@@ -185,7 +185,9 @@ class RectangularCoords(Base):
         return f"RectCoord({id}, {refpix_x:.2}, {refpix_y:.2}, {refpix_z:.2})"
 
     def get_spherical_coords(self):
-        """Returns the spherical coordinates of the center and the corner."""
+        """Returns the spherical representation of the reference and corner
+        pixels.
+        """
         return (
             rect2sphere(self.refpix_x, self.refpix_y, self.refpix_z),
             rect2sphere(self.corner_x, self.corner_y, self.corner_z)
@@ -225,6 +227,102 @@ class RectangularCoords(Base):
         size = size*DEG2RAD
         s2 = size/2.0
         center = sphere2rect(ra*DEG2RAD, dec*DEG2RAD)
+
+        with session.begin() as transaction:
+            stmt = (
+                select(TanWcs.crval1, TanWcs.crval2)
+                .join(cls.tanwcs)
+                .where(cls.refpix_x.between(center.x-s2, center.x+s2))
+                .where(cls.refpix_y.between(center.y-s2, center.y+s2))
+                .where(cls.refpix_z.between(center.z-s2, center.z+s2))
+            )
+            res = transaction.execute(stmt).all()
+        return np.array(res)
+
+    @classmethod
+    def all(cls):
+        """Returns an array of `(x, y, z)` triplets of all of the recorded
+        reference pixels.
+        """
+        with session.begin() as transaction:
+            res = transaction.execute(
+                select(cls.refpix_x, cls.refpix_y, cls.refpix_z)
+            )
+        return np.array(res.all())
+
+
+class RectangularHeliocentricCoords(Base):
+    """
+    A table representing the rectangular coordinate representation of the
+    associated `tan_wcs` rows expressed in heliocentric coordinates at a
+    distance of 50AU as they would-be observed through the year 2023. The
+
+    Rectangular coordinates apply only to the reference pixel for purposes of
+    an example.
+    """
+    __tablename__ = "rect_helio"
+
+    # these are the extended values, calculated at ingestion
+    # these are first order improvement on searching WCS pointing
+    # data directly because these columns can be indexed and subselected
+    # from more easily than the TanWcs
+    id: Mapped[int] = mapped_column(NpInt, primary_key=True)
+    """Unique auto-incremented ID of the associate rectangular coordinates."""
+
+    refpix_x: Mapped[float] = mapped_column(NpFloat)
+    """X coordinate of the reference pixel."""
+    refpix_y: Mapped[float] = mapped_column(NpFloat)
+    """Y coordinate of the reference pixel."""
+    refpix_z: Mapped[float] = mapped_column(NpFloat)
+    """Z coordinate of the reference pixel."""
+
+    tanwcs_id = mapped_column(NpInt, ForeignKey("tan_wcs.id"))
+    """The ID of the associated TanWCS."""
+    tanwcs: Mapped[TanWcs] = relationship(back_populates="rectheliocoord")
+    """The associated TanWCS object."""
+
+    def __repr__(self):
+        return f"RectHelioCoord({id}, {refpix_x:.2}, {refpix_y:.2}, {refpix_z:.2})"
+
+    def get_spherical_coords(self):
+        """Returns the spherical representation of the reference pixel."""
+        return rect2sphere(self.refpix_x, self.refpix_y, self.refpix_z)
+
+    @classmethod
+    def query_square(cls, lon, lat, size=1):
+        """Returns all records with coordinates within a square of given size
+        around the given center `(lon, lat, d=50AU)` coordinates.
+
+        Note that this selection is nor rather naive as its TanWCS counterpart
+        as the conversion of the given coordinates to the rectangular
+        heliocentric coordinates occurs before querying,
+        So, while the query resembles the TanWCS one:
+        ```
+        x BETWEEN x-size/2 AND x+size/2
+        y BETWEEN y-size/2 AND y+size/2
+        z BETWEEN z-size/2 AND z+size/2
+        ```
+        the end result does in fact include wrapping and parallax of the
+        observed frame centers at the pre-calculated distances.
+
+        Parameters
+        ----------
+        ra : `float`
+            Right ascension of the center of the square, in degrees
+        dec : `float`
+            Declination of the center of the square, in degrees
+        size : `float`, optional
+            Size of the square box around the center coordinates, in degrees.
+            Defaults to a square 1x1 degree in size.
+
+        Returns
+        -------
+        records : `numpy.array`
+            An array of `(lon, lat)` pairs within the requested square box.
+        """
+        size = size*DEG2RAD
+        s2 = size/2.0
+        center = sphere2rect(lon*DEG2RAD, lat*DEG2RAD)
 
         with session.begin() as transaction:
             stmt = (

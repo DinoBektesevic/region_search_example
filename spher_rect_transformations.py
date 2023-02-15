@@ -100,18 +100,54 @@ def sphere2rect(ra, dec):
     return GeomPoint(x, y, z)
 
 
-def rect2sphere(x, y, z):
+#def rect2sphere(x, y, z):
+#    """Convert given rectangular coordinates into their equivalent spherical
+#    coordinates.
+#
+#    Parameters
+#    ----------
+#    x : `float`
+#        X coordinate of the point
+#    y : `float`
+#        Y coordinate of the point
+#    z : `float`
+#        Z coordinate of the point
+#
+#    Returns
+#    -------
+#    rectanglular_coordinates : `GeomPoint`
+#        An `(x, y, z)` triplet, the rectangular coordinates equivalent to the
+#        given spherical coordinates.
+#    """
+#    r2 = x**2 + y**2
+#    r = np.sqrt(r2)
+#    theta = 0 if r2 == 0 else np.arctan2(y, x)
+#    phi = 0 if z == 0 else np.arctan2(z, r)
+#    return SpherePoint(r, theta, phi)
+
+
+def rect2sphere(*args, **kwargs):
     """Convert given rectangular coordinates into their equivalent spherical
     coordinates.
 
     Parameters
     ----------
-    x : `float`
-        X coordinate of the point
-    y : `float`
-        Y coordinate of the point
-    z : `float`
-        Z coordinate of the point
+    x : `float`, optional
+        X coordinate of the point.
+    y : `float`, optional
+        Y coordinate of the point.
+    z : `float`, optional
+        Z coordinate of the point.
+    array : `np.array` or `np.recarray`
+
+    Notes
+    -----
+    Arguments `x`, `y`, `z` must all be given together positionally or as
+    keywords, or the `array` needs to be provided, again positionally or as a
+    keyword. The given array can be a record array, or any array of the shape
+    `(3, N)` where `N` is the number of points with the layout:
+
+        `[(x, y, z), ... (x_N, y_N, z_N)]`
 
     Returns
     -------
@@ -119,8 +155,36 @@ def rect2sphere(x, y, z):
         An `(x, y, z)` triplet, the rectangular coordinates equivalent to the
         given spherical coordinates.
     """
+    # brother how bored am i...
+    arr = kwargs.pop("array", None)
+    x, y, z = kwargs.pop("x", None), kwargs.pop("z", None), kwargs.pop("z", None)
+    if len(args) == 3:
+        x, y, z = args
+    elif len(args) == 1:
+        arr = args[0]
+        if isinstance(arr, np.recarray):
+            x, y, z = arr.x, arr.y, arr.z
+        elif isinstance(arr, np.ndarray):
+            x, y, z = arr[:,0], arr[:,1], arr[:,2]
+
+    if any((x is None, y is None, z is None)):
+        raise ValueError(
+            "Expected x, y, z as args or kwargs, or array as arg or kwarg. "
+            "Array has to be a recarray or have shape (3, N). "
+            "Got {args}, {kwargs}"
+        )
+
     r2 = x**2 + y**2
     r = np.sqrt(r2)
-    theta = 0 if r2 == 0 else np.arctan2(y, x)
-    phi = 0 if z == 0 else np.arctan2(z, r)
+    theta = np.arctan2(y, x)
+    phi = np.arctan2(z, r)
+
+    theta[r2 == 0] = 0
+    phi[z == 0] = 0
+
+    if isinstance(x, np.ndarray):
+        return np.core.records.fromarrays(
+            [r, theta, phi],
+            dtype=[('r', float), ('theta', float), ('phi', float)]
+        )
     return SpherePoint(r, theta, phi)
