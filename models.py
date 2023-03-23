@@ -1,5 +1,14 @@
 import numpy as np
 
+import astropy.units as u
+from astropy.time import Time
+from astropy.coordinates import (
+    ICRS,
+    GeocentricTrueEcliptic,
+    HeliocentricTrueEcliptic,
+    angular_separation
+)
+
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy import (
     create_engine,
@@ -87,6 +96,9 @@ class TanWcs(Base):
     cd22: Mapped[float] = mapped_column(NpFloat)
     """Element (2, 2) of the affine transformation matrix."""
 
+    mjd: Mapped[float] = mapped_column(NpFloat)
+    """MJD of observation"""
+
     rectcoord: Mapped["RectangularCoords"] = relationship(back_populates="tanwcs")
     """Related rectangular coordinates associated with the reference, and
     corner pixel."""
@@ -134,11 +146,15 @@ class TanWcs(Base):
         return np.array(res)
 
     @classmethod
-    def all(cls):
+    def all(cls, withTime=False):
         """Returns an array of `(ra, dec)` pairs of all records in the table."""
+        cols = (cls.crval1, cls.crval2)
+        if withTime:
+            cols = (cls.crval1, cls.crval2, cls.mjd)
+
         with session.begin() as transaction:
             res = transaction.execute(
-                select(cls.crval1, cls.crval2)
+                select(*cols)
             )
         return np.array(res.all())
 
@@ -224,19 +240,29 @@ class RectangularCoords(Base):
         records : `numpy.array`
             An array of `(ra, dec)` pairs within the requested square box.
         """
-        size = size*DEG2RAD
-        s2 = size/2.0
         center = sphere2rect(ra*DEG2RAD, dec*DEG2RAD)
+        # we do mins and maxes here to avoid getting trapped in one
+        # of the poles by accident, almost positive there's a better way
+        edges = np.array([
+            sphere2rect((ra+size)*DEG2RAD, dec*DEG2RAD),
+            sphere2rect((ra-size)*DEG2RAD, dec*DEG2RAD),
+            sphere2rect(ra*DEG2RAD, (dec+size)*DEG2RAD),
+            sphere2rect(ra*DEG2RAD, (dec-size)*DEG2RAD)
+        ])
+        dists = (center.x-edges[:,0])**2 + (center.y-edges[:,1])**2 + (center.z-edges[:,2])**2
+        d = dists.max()
 
         with session.begin() as transaction:
             stmt = (
                 select(TanWcs.crval1, TanWcs.crval2)
                 .join(cls.tanwcs)
-                .where(cls.refpix_x.between(center.x-s2, center.x+s2))
-                .where(cls.refpix_y.between(center.y-s2, center.y+s2))
-                .where(cls.refpix_z.between(center.z-s2, center.z+s2))
+                .where(
+                    (cls.refpix_x - center.x)*(cls.refpix_x - center.x) +
+                    (cls.refpix_y - center.y)*(cls.refpix_y - center.y) +
+                    (cls.refpix_z - center.z)*(cls.refpix_z - center.z) <= d)
             )
             res = transaction.execute(stmt).all()
+
         return np.array(res)
 
     @classmethod
@@ -289,7 +315,7 @@ class RectangularHeliocentricCoords(Base):
         return rect2sphere(self.refpix_x, self.refpix_y, self.refpix_z)
 
     @classmethod
-    def query_square(cls, lon, lat, size=1):
+    def query_helio_square(cls, lon, lat, size=1):
         """Returns all records with coordinates within a square of given size
         around the given center `(lon, lat, d=50AU)` coordinates.
 
@@ -307,10 +333,10 @@ class RectangularHeliocentricCoords(Base):
 
         Parameters
         ----------
-        ra : `float`
-            Right ascension of the center of the square, in degrees
-        dec : `float`
-            Declination of the center of the square, in degrees
+        lon : `float`
+            Longitude, in decimal degrees.
+        lat : `float`
+            Latitude, in decimal degrees
         size : `float`, optional
             Size of the square box around the center coordinates, in degrees.
             Defaults to a square 1x1 degree in size.
@@ -320,20 +346,103 @@ class RectangularHeliocentricCoords(Base):
         records : `numpy.array`
             An array of `(lon, lat)` pairs within the requested square box.
         """
-        size = size*DEG2RAD
-        s2 = size/2.0
         center = sphere2rect(lon*DEG2RAD, lat*DEG2RAD)
+        # we do mins and maxes here to avoid getting tlonpped in one
+        # of the poles by accident, almost positive there's a better way
+        edges = np.array([
+            sphere2rect((lon+size)*DEG2RAD, lat*DEG2RAD),
+            sphere2rect((lon-size)*DEG2RAD, lat*DEG2RAD),
+            sphere2rect(lon*DEG2RAD, (lat+size)*DEG2RAD),
+            sphere2rect(lon*DEG2RAD, (lat-size)*DEG2RAD)
+        ])
+        dists = (center.x-edges[:,0])**2 + (center.y-edges[:,1])**2 + (center.z-edges[:,2])**2
+        d = dists.max()
 
         with session.begin() as transaction:
             stmt = (
                 select(TanWcs.crval1, TanWcs.crval2)
                 .join(cls.tanwcs)
-                .where(cls.refpix_x.between(center.x-s2, center.x+s2))
-                .where(cls.refpix_y.between(center.y-s2, center.y+s2))
-                .where(cls.refpix_z.between(center.z-s2, center.z+s2))
+                .where(
+                    (cls.refpix_x - center.x)*(cls.refpix_x - center.x) +
+                    (cls.refpix_y - center.y)*(cls.refpix_y - center.y) +
+                    (cls.refpix_z - center.z)*(cls.refpix_z - center.z) <= d)
             )
             res = transaction.execute(stmt).all()
         return np.array(res)
+
+    @classmethod
+    def query_square_dist2(cls, lon, lat, distance, size=1):
+        t = Time(59945.0, format="mjd", scale="utc")
+        icrs = HeliocentricTrueEcliptic(
+            lon=lon*u.deg,
+            lat=lat*u.deg,
+            distance=distance*u.AU
+        ).transform_to((GeocentricTrueEcliptic(obstime=t)))
+
+        return RectangularCoords.query_square(icrs.lon.value, icrs.lat.value, size=size)
+
+
+    @classmethod
+    def query_square_dist(cls, ra, dec, distance, size=1):
+        """Returns all records with coordinates within a square of given size
+        around the given center and distance `(lon, lat, d=distanceAU)` coordinates,
+        **Assumes all observations were taken at the same time!**
+
+        Note that this selection is nor rather naive as its TanWCS counterpart
+        as the conversion of the given coordinates to the rectangular
+        heliocentric coordinates occurs before querying,
+        So, while the query resembles the TanWCS one:
+        ```
+        x BETWEEN x-size/2 AND x+size/2
+        y BETWEEN y-size/2 AND y+size/2
+        z BETWEEN z-size/2 AND z+size/2
+        ```
+        the end result does in fact include wrapping and parallax of the
+        observed frame centers at the pre-calculated distances.
+
+        Parameters
+        ----------
+        lon : `float`
+            Longitude, in decimal degrees.
+        lat : `float`
+            Latitude, in decimal degrees
+        size : `float`, optional
+            Size of the square box around the center coordinates, in degrees.
+            Defaults to a square 1x1 degree in size.
+
+        Returns
+        -------
+        records : `numpy.array`
+            An array of `(lon, lat)` pairs within the requested square box.
+        """
+        #t = Time(59945.0, format="mjd", scale="utc")
+        res = TanWcs.all(withTime=True)
+        racat, deccat, t = res[:, 0], res[:, 1], res[:, 2]
+        t = Time(t, format="mjd", scale="utc")
+
+        # remove the origin shift of ICRS assumption and calculates the Geo
+        # coords as seen at the time of observation
+        refpix_icrs = ICRS(ra=racat*u.deg, dec=deccat*u.deg)
+        refpix_geo = refpix_icrs.transform_to(GeocentricTrueEcliptic(
+            obstime=t
+        ))
+
+        # Add an assumed distance to the observed position
+        refpix_nolie = GeocentricTrueEcliptic(
+            refpix_geo.lon,
+            refpix_geo.lat,
+            distance=distance,
+            obstime=t
+        )
+
+        # Transform back to ICRS, now including parallax due to distance
+        # not just origin shift
+        icrs = refpix_nolie.transform_to(ICRS())
+
+        dists = angular_separation(ra*u.deg, dec*u.deg, icrs.ra, icrs.dec)
+        resmask = dists <= size*u.deg
+
+        return np.array([racat[resmask], deccat[resmask]])
 
     @classmethod
     def all(cls):
@@ -343,5 +452,5 @@ class RectangularHeliocentricCoords(Base):
         with session.begin() as transaction:
             res = transaction.execute(
                 select(cls.refpix_x, cls.refpix_y, cls.refpix_z)
-            )
+           )
         return np.array(res.all())

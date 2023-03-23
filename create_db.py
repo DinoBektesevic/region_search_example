@@ -55,10 +55,25 @@ chunksize = int(NFRAMES/2) if NFRAMES <= 10000 else 10000
 nchunks = int(np.rint(NFRAMES/chunksize))
 nchunks = 1 if nchunks==0 else nchunks
 
+
+def uniform_sphere_sample(
+        n,
+        thetalim=[-np.pi, np.pi],
+        philim=[-np.pi/2, np.pi/2]
+):
+    theta = 2*np.pi*np.random.uniform(0, 1, size=n)
+    phi = np.arcsin(2*np.random.uniform(0, 1, size=n) - 1)
+    return theta*RAD2DEG, phi*RAD2DEG
+
 idxs = np.arange(1, NFRAMES+1, dtype=int)
-ras = np.random.uniform(0, 360.0, size=NFRAMES)
-decs = np.random.uniform(-90.0, 90.0, size=NFRAMES)
 mjds = np.random.uniform(59945.0, 60307.0, size=NFRAMES)
+# uniform sphere
+ras = 2*np.pi * np.random.uniform(0, 1, size=NFRAMES) * RAD2DEG
+decs = np.arcsin(2*np.random.uniform(0, 1, size=NFRAMES) - 1) * RAD2DEG
+# uniform flat
+#ras = np.random.uniform(0, 360.0, size=NFRAMES)
+#decs = np.random.uniform(-90.0, 90.0, size=NFRAMES)
+
 
 hdu = fits.PrimaryHDU()
 header = hdu.header
@@ -111,6 +126,7 @@ for idx, ra, dec, mjd in zip(idxs, ras, decs, mjds):
         cd12 = header["CD1_2"],
         cd21 = header["CD2_1"],
         cd22 = header["CD2_2"],
+        mjd = mjd
     ))
 
     # Construct the WCS, calc corner, convert to rect, create and append obj
@@ -149,16 +165,16 @@ for idx, ra, dec, mjd in zip(idxs, ras, decs, mjds):
     # Transform to heliocentric ecliptic and then represent as rectangular
     # coordinates. This is what's required for RectangularHeliocentricCoords
     t = Time(mjd, format="mjd", scale="utc")
-    refpix_icrs = ICRS(ra=ra*u.deg, dec=dec*u.deg)
-    refpix_geo = refpix_icrs.transform_to(GeocentricTrueEcliptic(obstime=t))
 
-    refpix_nolie = GeocentricTrueEcliptic(
-        refpix_geo.lon,
-        refpix_geo.lat,
-        distance=DISTANCE,
+    # THIS IS NOT A CORRECT CALCULATION
+    # SEE NOTEBOOK 02, WILL BE UPDATED PROMPTLY (note left @ March 22)
+    refpix_helio = ICRS(
+        ra=ra*u.deg,
+        dec=dec*u.deg,
+        distance=DISTANCE
+    ).transform_to(HeliocentricTrueEcliptic(
         obstime=t
-    )
-    refpix_helio = refpix_nolie.transform_to(HeliocentricTrueEcliptic(obstime=t))
+    ))
 
     refpix = sphere2rect(refpix_helio.lon.rad, refpix_helio.lat.rad)
     rectheliocoords.append(RectangularHeliocentricCoords(
