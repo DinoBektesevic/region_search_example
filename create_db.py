@@ -9,15 +9,16 @@ from astropy.io import fits
 from astropy.time import Time
 from astropy.coordinates import (
     ICRS,
-    HeliocentricTrueEcliptic,
-    GeocentricTrueEcliptic
+    GCRS,
+    solar_system_ephemeris,
+    EarthLocation
 )
 
 from models import (
     session,
     TanWcs,
     RectangularCoords,
-    RectangularHeliocentricCoords,
+    RectangularBarycentricCoords,
     Base,
     engine
 )
@@ -27,6 +28,7 @@ from spher_rect_transformations import (
     DEG2RAD,
     RAD2DEG
 )
+from parallax import correct_parallax
 
 
 logging.basicConfig(
@@ -42,6 +44,10 @@ logging.basicConfig(
 # Sets the number of frames that will be faked and ingested
 NFRAMES = 30000
 DISTANCE = 50*u.AU
+
+# Observations were made from CTIO observatory
+with solar_system_ephemeris.set('de432s'):
+    location = EarthLocation.of_site('ctio')
 
 
 ###############################################################################
@@ -162,22 +168,14 @@ for idx, ra, dec, mjd in zip(idxs, ras, decs, mjds):
     ))
 
     # Specify the remaining missing WCS values - coord. sys., scale and times
-    # Transform to heliocentric ecliptic and then represent as rectangular
+    # Correct for parallax at 50AU and then represent as rectangular
     # coordinates. This is what's required for RectangularHeliocentricCoords
     t = Time(mjd, format="mjd", scale="utc")
-
-    # THIS IS NOT A CORRECT CALCULATION
-    # SEE NOTEBOOK 02, WILL BE UPDATED PROMPTLY (note left @ March 22)
-    refpix_helio = ICRS(
-        ra=ra*u.deg,
-        dec=dec*u.deg,
-        distance=DISTANCE
-    ).transform_to(HeliocentricTrueEcliptic(
-        obstime=t
-    ))
-
-    refpix = sphere2rect(refpix_helio.lon.rad, refpix_helio.lat.rad)
-    rectheliocoords.append(RectangularHeliocentricCoords(
+    refpix_helio = ICRS(ra=ra*u.deg, dec=dec*u.deg)
+    refpix = correct_parallax(refpix_helio, t, location, DISTANCE.to(u.AU).value)
+    refpix = sphere2rect(refpix.ra.rad, refpix.dec.rad)
+    breakpoint()
+    rectheliocoords.append(RectangularBarycentricCoords(
         id = idx,
         refpix_x = refpix.x,
         refpix_y = refpix.y,

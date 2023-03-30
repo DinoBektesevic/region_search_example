@@ -63,9 +63,7 @@ class TanWcs(Base):
     The recorded values are sufficient to perform the linear transformations to
     intermediate pixel coordinates, as described by Greisen and Calabretta in
     their 1st paper. The assumptions that the values are given in decimal
-    degree format, in a Earth-centered Ecliptic Coordinate System, with no
-    additional non-linear transformations are required to complete the
-    transformation to the final world coordinates.
+    degree format and in ICRS.
     """
     __tablename__= "tan_wcs"
 
@@ -102,7 +100,7 @@ class TanWcs(Base):
     rectcoord: Mapped["RectangularCoords"] = relationship(back_populates="tanwcs")
     """Related rectangular coordinates associated with the reference, and
     corner pixel."""
-    rectheliocoord: Mapped["RectangularHeliocentricCoords"] = relationship(back_populates="tanwcs")
+    rectheliocoord: Mapped["RectangularBarycentricCoords"] = relationship(back_populates="tanwcs")
     """Related rectangular heliocentric coordinates associated with the
     reference, and corner pixel."""
 
@@ -214,9 +212,9 @@ class RectangularCoords(Base):
         """Returns all records with coordinates within a square of given size
         around the given center `(ra, dec)` coordinates.
 
-        Note that this selection is nor rather naive as its TanWCS counterpart
-        as the conversion to rectangular coordinates, of the given coordinates
-        occurs before querying, So, while the query resembles the TanWCS one:
+        Note that this selection is not as naive as its TanWCS counterpart
+        since the conversion to rectangular coordinates occurs before querying.
+        So, while the query resembles the TanWCS one:
         ```
         x BETWEEN x-size/2 AND x+size/2
         y BETWEEN y-size/2 AND y+size/2
@@ -224,6 +222,9 @@ class RectangularCoords(Base):
         ```
         the end result does in fact include wrapping and correct distance
         calculation between points.
+
+        This demonstrates why it is difficult to directly perform searches in
+        spherical coordinates.
 
         Parameters
         ----------
@@ -277,10 +278,10 @@ class RectangularCoords(Base):
         return np.array(res.all())
 
 
-class RectangularHeliocentricCoords(Base):
+class RectangularBarycentricCoords(Base):
     """
     A table representing the rectangular coordinate representation of the
-    associated `tan_wcs` rows expressed in heliocentric coordinates at a
+    associated `tan_wcs` rows expressed in ICRS barycentric coordinates at a
     distance of 50AU as they would-be observed through the year 2023. The
 
     Rectangular coordinates apply only to the reference pixel for purposes of
@@ -308,16 +309,16 @@ class RectangularHeliocentricCoords(Base):
     """The associated TanWCS object."""
 
     def __repr__(self):
-        return f"RectHelioCoord({id}, {refpix_x:.2}, {refpix_y:.2}, {refpix_z:.2})"
+        return f"RectBaryCoord({id}, {refpix_x:.2}, {refpix_y:.2}, {refpix_z:.2})"
 
     def get_spherical_coords(self):
         """Returns the spherical representation of the reference pixel."""
         return rect2sphere(self.refpix_x, self.refpix_y, self.refpix_z)
 
     @classmethod
-    def query_helio_square(cls, lon, lat, size=1):
+    def query_helio_square(cls, ra, dec, size=1):
         """Returns all records with coordinates within a square of given size
-        around the given center `(lon, lat, d=50AU)` coordinates.
+        around the given center `ICRS(ra, dec, d=50AU)` coordinates.
 
         Note that this selection is nor rather naive as its TanWCS counterpart
         as the conversion of the given coordinates to the rectangular
@@ -329,14 +330,14 @@ class RectangularHeliocentricCoords(Base):
         z BETWEEN z-size/2 AND z+size/2
         ```
         the end result does in fact include wrapping and parallax of the
-        observed frame centers at the pre-calculated distances.
+        observed frame centers at the pre-calcudeced distances.
 
         Parameters
         ----------
-        lon : `float`
-            Longitude, in decimal degrees.
-        lat : `float`
-            Latitude, in decimal degrees
+        ra : `float`
+            Ragitude, in decimal degrees.
+        dec : `float`
+            Decitude, in decimal degrees
         size : `float`, optional
             Size of the square box around the center coordinates, in degrees.
             Defaults to a square 1x1 degree in size.
@@ -344,16 +345,16 @@ class RectangularHeliocentricCoords(Base):
         Returns
         -------
         records : `numpy.array`
-            An array of `(lon, lat)` pairs within the requested square box.
+            An array of `(ra, dec)` pairs within the requested square box.
         """
-        center = sphere2rect(lon*DEG2RAD, lat*DEG2RAD)
-        # we do mins and maxes here to avoid getting tlonpped in one
+        center = sphere2rect(ra*DEG2RAD, dec*DEG2RAD)
+        # we do mins and maxes here to avoid getting trapped in one
         # of the poles by accident, almost positive there's a better way
         edges = np.array([
-            sphere2rect((lon+size)*DEG2RAD, lat*DEG2RAD),
-            sphere2rect((lon-size)*DEG2RAD, lat*DEG2RAD),
-            sphere2rect(lon*DEG2RAD, (lat+size)*DEG2RAD),
-            sphere2rect(lon*DEG2RAD, (lat-size)*DEG2RAD)
+            sphere2rect((ra+size)*DEG2RAD, dec*DEG2RAD),
+            sphere2rect((ra-size)*DEG2RAD, dec*DEG2RAD),
+            sphere2rect(ra*DEG2RAD, (dec+size)*DEG2RAD),
+            sphere2rect(ra*DEG2RAD, (dec-size)*DEG2RAD)
         ])
         dists = (center.x-edges[:,0])**2 + (center.y-edges[:,1])**2 + (center.z-edges[:,2])**2
         d = dists.max()
@@ -365,22 +366,11 @@ class RectangularHeliocentricCoords(Base):
                 .where(
                     (cls.refpix_x - center.x)*(cls.refpix_x - center.x) +
                     (cls.refpix_y - center.y)*(cls.refpix_y - center.y) +
-                    (cls.refpix_z - center.z)*(cls.refpix_z - center.z) <= d)
+                    (cls.refpix_z - center.z)*(cls.refpix_z - center.z) <= d
+                )
             )
             res = transaction.execute(stmt).all()
         return np.array(res)
-
-    @classmethod
-    def query_square_dist2(cls, lon, lat, distance, size=1):
-        t = Time(59945.0, format="mjd", scale="utc")
-        icrs = HeliocentricTrueEcliptic(
-            lon=lon*u.deg,
-            lat=lat*u.deg,
-            distance=distance*u.AU
-        ).transform_to((GeocentricTrueEcliptic(obstime=t)))
-
-        return RectangularCoords.query_square(icrs.lon.value, icrs.lat.value, size=size)
-
 
     @classmethod
     def query_square_dist(cls, ra, dec, distance, size=1):

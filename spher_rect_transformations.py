@@ -63,7 +63,11 @@ __all__ = [
 
 
 DEG2RAD = 0.017453292519943295
+"""Conversion factor, once multiplied with, converts degrees to radians."""
+
+
 RAD2DEG = 57.29577951308232
+"""Conversion factor, once multiplied with, converts radians to degrees."""
 
 
 GeomPoint = namedtuple("GeomPoint", ("x", "y", "z"))
@@ -98,32 +102,6 @@ def sphere2rect(ra, dec):
     y = np.sin(ra)*np.cos(dec)
     z = np.sin(dec)
     return GeomPoint(x, y, z)
-
-
-#def rect2sphere(x, y, z):
-#    """Convert given rectangular coordinates into their equivalent spherical
-#    coordinates.
-#
-#    Parameters
-#    ----------
-#    x : `float`
-#        X coordinate of the point
-#    y : `float`
-#        Y coordinate of the point
-#    z : `float`
-#        Z coordinate of the point
-#
-#    Returns
-#    -------
-#    rectanglular_coordinates : `GeomPoint`
-#        An `(x, y, z)` triplet, the rectangular coordinates equivalent to the
-#        given spherical coordinates.
-#    """
-#    r2 = x**2 + y**2
-#    r = np.sqrt(r2)
-#    theta = 0 if r2 == 0 else np.arctan2(y, x)
-#    phi = 0 if z == 0 else np.arctan2(z, r)
-#    return SpherePoint(r, theta, phi)
 
 
 def rect2sphere(*args, **kwargs):
